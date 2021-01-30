@@ -3,12 +3,10 @@ import binascii
 import imghdr
 import io
 import uuid
-
+from django.core import checks
 from django.core.exceptions import ValidationError
-from django.core.files.uploadedfile import SimpleUploadedFile
-from django.contrib.postgres import fields as postgres_fields
+from django.core.files.base import ContentFile
 from django.utils.translation import gettext_lazy as _
-from psycopg2.extras import DateRange, DateTimeTZRange, NumericRange
 from rest_framework.fields import (
     DateField,
     DateTimeField,
@@ -22,14 +20,22 @@ from rest_framework.fields import (
 )
 from rest_framework.serializers import ModelSerializer
 from rest_framework.utils import html
+
 from drf_extra_fields import compat
+
+try:
+    from django.contrib.postgres import fields as postgres_fields
+    from psycopg2.extras import DateRange, DateTimeTZRange, NumericRange
+except:
+    postgres_fields = None
+    DateRange = None
+    DateTimeTZRange = None
+    NumericRange = None
 
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
 
 class Base64FieldMixin(object):
-    EMPTY_VALUES = (None, "", [], (), {})
-
     @property
     def ALLOWED_TYPES(self):
         raise NotImplementedError
@@ -42,9 +48,10 @@ class Base64FieldMixin(object):
     def INVALID_TYPE_MESSAGE(self):
         raise NotImplementedError
 
+    EMPTY_VALUES = (None, '', [], (), {})
+
     def __init__(self, *args, **kwargs):
-        self.trust_provided_content_type = kwargs.pop("trust_provided_content_type", False)
-        self.represent_in_base64 = kwargs.pop("represent_in_base64", False)
+        self.represent_in_base64 = kwargs.pop('represent_in_base64', False)
         super(Base64FieldMixin, self).__init__(*args, **kwargs)
 
     def to_internal_value(self, base64_data):
@@ -53,39 +60,26 @@ class Base64FieldMixin(object):
             return None
 
         if isinstance(base64_data, str):
-            file_mime_type = None
-
-            # Strip base64 header, get mime_type from base64 header.
-            if ";base64," in base64_data:
-                header, base64_data = base64_data.split(";base64,")
-                if self.trust_provided_content_type:
-                    file_mime_type = header.replace("data:", "")
+            # Strip base64 header.
+            if ';base64,' in base64_data:
+                header, base64_data = base64_data.split(';base64,')
 
             # Try to decode the file. Return validation error if it fails.
             try:
                 decoded_file = base64.b64decode(base64_data)
             except (TypeError, binascii.Error, ValueError):
                 raise ValidationError(self.INVALID_FILE_MESSAGE)
-
             # Generate file name:
             file_name = self.get_file_name(decoded_file)
-
             # Get the file name extension:
             file_extension = self.get_file_extension(file_name, decoded_file)
-
             if file_extension not in self.ALLOWED_TYPES:
                 raise ValidationError(self.INVALID_TYPE_MESSAGE)
-
             complete_file_name = file_name + "." + file_extension
-            data = SimpleUploadedFile(
-                name=complete_file_name,
-                content=decoded_file,
-                content_type=file_mime_type
-            )
-
+            data = ContentFile(decoded_file, name=complete_file_name)
             return super(Base64FieldMixin, self).to_internal_value(data)
-
-        raise ValidationError(_("Invalid type. This is not an base64 string: {}".format(type(base64_data))))
+        raise ValidationError(_('Invalid type. This is not an base64 string: {}'.format(
+            type(base64_data))))
 
     def get_file_extension(self, filename, decoded_file):
         raise NotImplementedError
@@ -100,10 +94,10 @@ class Base64FieldMixin(object):
             # empty base64 str rather than let the exception propagate unhandled
             # up into serializers.
             if not file:
-                return ""
+                return ''
 
             try:
-                with open(file.path, "rb") as f:
+                with open(file.path, 'rb') as f:
                     return base64.b64encode(f.read()).decode()
             except Exception:
                 raise IOError("Error encoding file")
@@ -190,6 +184,27 @@ class RangeField(DictField):
         'bound_ordering': _('The start of the range must not exceed the end of the range.'),
     })
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        checks = self.check()
+
+        for check in checks:
+            logger.error(check)
+
+    def check(self, **kwargs):
+        """Check if postgres is none. you can also extend this function to check more things.
+        """
+        errors = []
+        if postgres_fields is None:
+            errors.append(
+                checks.Error(
+                    "'psgl2' is required to use {name}".format(name=self.__class__.__name__),
+                    hint="Install the 'psycopg2' library from 'pip'",
+                    obj=self
+                )
+            )
+        return errors
+
     def to_internal_value(self, data):
         """
         Range instances <- Dicts of primitive datatypes.
@@ -234,23 +249,15 @@ class RangeField(DictField):
         """
         Range instances -> dicts of primitive datatypes.
         """
-        if isinstance(value, dict):
-            if not value:
-                return value
-
-            lower = value.get("lower")
-            upper = value.get("upper")
-            bounds = value.get("bounds")
-        else:
-            if value.isempty:
-                return {'empty': True}
-            lower = value.lower
-            upper = value.upper
-            bounds = value._bounds
-
-        return {'lower': self.child.to_representation(lower) if lower is not None else None,
-                'upper': self.child.to_representation(upper) if upper is not None else None,
-                'bounds': bounds}
+        if value.isempty:
+            return {'empty': True}
+        lower = self.child.to_representation(value.lower) if value.lower is not None else None
+        upper = self.child.to_representation(value.upper) if value.upper is not None else None
+        return {
+            'lower': lower,
+            'upper': upper,
+            'bounds': value._bounds
+        }
 
     def get_initial(self):
         initial = super().get_initial()
@@ -282,15 +289,15 @@ class DateRangeField(RangeField):
     range_type = DateRange
 
 
-# monkey patch modelserializer to map Native django Range fields to
-# drf_extra_fiels's Range fields.
-
-ModelSerializer.serializer_field_mapping[postgres_fields.DateTimeRangeField] = DateTimeRangeField
-ModelSerializer.serializer_field_mapping[postgres_fields.DateRangeField] = DateRangeField
-ModelSerializer.serializer_field_mapping[postgres_fields.IntegerRangeField] = IntegerRangeField
-ModelSerializer.serializer_field_mapping[postgres_fields.DecimalRangeField] = DecimalRangeField
-if compat.FloatRangeField:
-    ModelSerializer.serializer_field_mapping[compat.FloatRangeField] = FloatRangeField
+if postgres_fields:
+    # monkey patch modelserializer to map Native django Range fields to
+    # drf_extra_fiels's Range fields.
+    ModelSerializer.serializer_field_mapping[postgres_fields.DateTimeRangeField] = DateTimeRangeField
+    ModelSerializer.serializer_field_mapping[postgres_fields.DateRangeField] = DateRangeField
+    ModelSerializer.serializer_field_mapping[postgres_fields.IntegerRangeField] = IntegerRangeField
+    ModelSerializer.serializer_field_mapping[postgres_fields.DecimalRangeField] = DecimalRangeField
+    if compat.FloatRangeField:
+        ModelSerializer.serializer_field_mapping[compat.FloatRangeField] = FloatRangeField
 
 
 class LowercaseEmailField(EmailField):
@@ -298,6 +305,7 @@ class LowercaseEmailField(EmailField):
     An enhancement over django-rest-framework's EmailField to allow
     case-insensitive serialization and deserialization of e-mail addresses.
     """
+
     def to_internal_value(self, data):
         data = super(LowercaseEmailField, self).to_internal_value(data)
         return data.lower()
